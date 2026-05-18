@@ -236,14 +236,8 @@ async def test_send_typing_does_not_fall_back_to_root_for_dm_topic():
 
 
 @pytest.mark.asyncio
-async def test_send_typing_attempts_api_call_for_dm_topic_reply_fallback():
-    """Hermes-created DM topic lanes should still attempt scoped typing.
-
-    Some private DM topic lanes route message sends through reply-anchor
-    fallback, but live Telegram testing shows sendChatAction accepts the lane's
-    message_thread_id. If Telegram rejects a stale or invalid thread later,
-    send_typing already swallows that failure as non-fatal.
-    """
+async def test_send_typing_skips_dm_topic_reply_fallback():
+    """Hermes-created DM topic fallback lanes cannot safely scope chat actions."""
     adapter = _make_adapter()
     call_log = []
 
@@ -261,9 +255,7 @@ async def test_send_typing_attempts_api_call_for_dm_topic_reply_fallback():
         },
     )
 
-    assert call_log == [
-        {"chat_id": 12345, "action": "typing", "message_thread_id": 20197},
-    ]
+    assert call_log == []
 
 
 @pytest.mark.asyncio
@@ -294,6 +286,30 @@ async def test_send_retries_without_thread_on_thread_not_found():
     assert len(call_log) == 2
     assert call_log[0]["message_thread_id"] == 99999
     assert call_log[1]["message_thread_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_fallback_to_main_chat_when_routed_topic_missing():
+    """Routed profile replies must not leak into the parent chat."""
+    adapter = _make_adapter()
+
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="test message",
+        metadata={"thread_id": "99999", "disable_thread_fallback": True},
+    )
+
+    assert result.success is False
+    assert len(call_log) == 1
+    assert call_log[0]["message_thread_id"] == 99999
 
 
 @pytest.mark.asyncio
@@ -331,7 +347,43 @@ def test_base_gateway_metadata_marks_telegram_dm_topics_as_reply_fallback():
     assert metadata == {
         "thread_id": "20189",
         "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "20189",
         "telegram_reply_to_message_id": "462",
+    }
+
+
+def test_base_gateway_metadata_marks_routed_telegram_profiles_no_fallback():
+    source = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        thread_id="20189",
+        agent_profile="shopping",
+    )
+
+    metadata = _thread_metadata_for_source(source, "462")
+
+    assert metadata == {
+        "thread_id": "20189",
+        "disable_thread_fallback": True,
+    }
+
+
+def test_base_gateway_metadata_combines_routed_dm_profile_flags():
+    source = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        thread_id="20189",
+        agent_profile="shopping",
+    )
+
+    metadata = _thread_metadata_for_source(source, "462")
+
+    assert metadata == {
+        "thread_id": "20189",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "20189",
+        "telegram_reply_to_message_id": "462",
+        "disable_thread_fallback": True,
     }
 
 
@@ -588,6 +640,65 @@ async def test_send_dm_topic_reply_not_found_retry_drops_thread_id():
     assert call_log[1]["reply_to_message_id"] is None
     assert "message_thread_id" not in call_log[1]
     assert "direct_messages_topic_id" not in call_log[1]
+
+
+@pytest.mark.asyncio
+async def test_routed_dm_topic_reply_not_found_does_not_fallback_to_main_chat():
+    """Routed profile DM-topic replies must not drop the topic anchor."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message to be replied not found")
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="anchor disappeared",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+            "disable_thread_fallback": True,
+        },
+    )
+
+    assert result.success is False
+    assert len(call_log) == 1
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] == 20197
+
+
+@pytest.mark.asyncio
+async def test_routed_dm_topic_media_reply_not_found_does_not_fallback_to_main_chat(tmp_path):
+    adapter = _make_adapter()
+    media_path = tmp_path / "report.txt"
+    media_path.write_text("report", encoding="utf-8")
+    call_log = []
+
+    async def mock_send_document(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message to be replied not found")
+
+    adapter._bot = SimpleNamespace(send_document=mock_send_document)
+
+    result = await adapter.send_document(
+        chat_id="123",
+        file_path=str(media_path),
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+            "disable_thread_fallback": True,
+        },
+    )
+
+    assert result.success is False
+    assert len(call_log) == 1
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] == 20197
 
 
 @pytest.mark.asyncio

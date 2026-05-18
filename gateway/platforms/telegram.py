@@ -617,6 +617,7 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> bool:
         return (
             bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
+            and not bool(metadata and metadata.get("disable_thread_fallback"))
             and reply_to_message_id is not None
             and cls._is_bad_request_error(error)
             and "message to be replied not found" in str(error).lower()
@@ -1527,6 +1528,9 @@ class TelegramAdapter(BasePlatformAdapter):
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
+            disable_thread_fallback = bool(
+                isinstance(metadata, dict) and metadata.get("disable_thread_fallback")
+            )
             
             try:
                 from telegram.error import NetworkError as _NetErr
@@ -1600,6 +1604,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
+                                if disable_thread_fallback:
+                                    logger.warning(
+                                        "[%s] Thread %s not found for routed profile; not retrying in main chat",
+                                        self.name, effective_thread_id,
+                                    )
+                                    raise
                                 # Thread doesn't exist — retry without
                                 # message_thread_id so the message still
                                 # reaches the chat.
@@ -1612,6 +1622,12 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
+                                if disable_thread_fallback:
+                                    logger.warning(
+                                        "[%s] Reply target deleted for routed profile; not retrying in main chat",
+                                        self.name,
+                                    )
+                                    raise
                                 # Original message was deleted before we
                                 # could reply. For private-topic fallback
                                 # sends, message_thread_id is only valid with
@@ -3513,6 +3529,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send typing indicator."""
         if self._bot:
             try:
+                if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
+                    return
                 _typing_thread = self._metadata_thread_id(metadata)
                 message_thread_id = self._message_thread_id_for_typing(_typing_thread)
                 # No retry-without-thread fallback here: _message_thread_id_for_typing
@@ -4065,6 +4083,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching."""
         from gateway.session import build_session_key
+        self._hydrate_routed_event_source(event)
         return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -4154,6 +4173,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
         """Return a batching key for Telegram photos/albums."""
         from gateway.session import build_session_key
+        self._hydrate_routed_event_source(event)
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -4432,6 +4452,17 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await self.handle_message(event)
 
+    def _media_group_batch_key(self, event: MessageEvent, media_group_id: str) -> str:
+        """Return a session-scoped key for Telegram albums."""
+        from gateway.session import build_session_key
+        self._hydrate_routed_event_source(event)
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        return f"{session_key}:album:{media_group_id}"
+
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
 
@@ -4440,33 +4471,34 @@ class TelegramAdapter(BasePlatformAdapter):
         new user message and interrupts the first. We debounce briefly and merge the
         attachments into a single MessageEvent.
         """
-        existing = self._media_group_events.get(media_group_id)
+        batch_key = self._media_group_batch_key(event, media_group_id)
+        existing = self._media_group_events.get(batch_key)
         if existing is None:
-            self._media_group_events[media_group_id] = event
+            self._media_group_events[batch_key] = event
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 
-        prior_task = self._media_group_tasks.get(media_group_id)
+        prior_task = self._media_group_tasks.get(batch_key)
         if prior_task:
             prior_task.cancel()
 
-        self._media_group_tasks[media_group_id] = asyncio.create_task(
-            self._flush_media_group_event(media_group_id)
+        self._media_group_tasks[batch_key] = asyncio.create_task(
+            self._flush_media_group_event(batch_key)
         )
 
-    async def _flush_media_group_event(self, media_group_id: str) -> None:
+    async def _flush_media_group_event(self, batch_key: str) -> None:
         try:
             await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
-            event = self._media_group_events.pop(media_group_id, None)
+            event = self._media_group_events.pop(batch_key, None)
             if event is not None:
                 await self.handle_message(event)
         except asyncio.CancelledError:
             return
         finally:
-            self._media_group_tasks.pop(media_group_id, None)
+            self._media_group_tasks.pop(batch_key, None)
 
     async def _handle_sticker(self, msg: Message, event: "MessageEvent") -> None:
         """
@@ -4734,14 +4766,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     or None
                 )
 
-        # Per-channel/topic ephemeral prompt
-        from gateway.platforms.base import resolve_channel_prompt
+        # Per-channel/topic ephemeral prompt and optional profile routing.
+        from gateway.platforms.base import resolve_channel_prompt, resolve_topic_profile
         _chat_id_str = str(chat.id)
         _channel_prompt = resolve_channel_prompt(
             self.config.extra,
             thread_id_str or _chat_id_str,
             _chat_id_str if thread_id_str else None,
         )
+        _topic_profile = resolve_topic_profile(self.config.extra, _chat_id_str, thread_id_str)
+        _agent_profile = (_topic_profile or {}).get("profile")
+        _agent_hermes_home = (_topic_profile or {}).get("profile_home")
+        if _agent_profile:
+            source.agent_profile = _agent_profile
+        if _agent_hermes_home:
+            source.agent_hermes_home = _agent_hermes_home
 
         return MessageEvent(
             text=message.text or "",
@@ -4754,6 +4793,8 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
+            agent_profile=_agent_profile,
+            agent_hermes_home=_agent_hermes_home,
             timestamp=message.date,
         )
 

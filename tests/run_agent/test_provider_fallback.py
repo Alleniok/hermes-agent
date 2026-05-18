@@ -5,7 +5,10 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+import os
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
@@ -181,6 +184,78 @@ class TestFallbackChainAdvancement:
         ):
             assert agent._try_activate_fallback() is True
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
+
+    def test_init_time_fallback_uses_profile_runtime_env_key_env(self):
+        """Routed profiles must not read fallback keys from process env."""
+        fallback = {
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4",
+            "key_env": "PROFILE_FALLBACK_KEY",
+        }
+        fallback_keys = []
+
+        def fake_resolve(provider, **kwargs):
+            if provider == "zai":
+                return None, None
+            fallback_keys.append(kwargs.get("explicit_api_key"))
+            return _mock_client(api_key=kwargs.get("explicit_api_key")), fallback["model"]
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve),
+        ):
+            agent = AIAgent(
+                provider="zai",
+                model="primary-model",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=fallback,
+                runtime_env={"PROFILE_FALLBACK_KEY": "profile-secret"},
+            )
+
+        assert "profile-secret" in fallback_keys
+        assert "global-secret" not in fallback_keys
+        assert agent.provider == "openrouter"
+        assert agent.api_key == "profile-secret"
+
+    def test_init_time_fallback_fails_closed_without_profile_key(self):
+        fallback = {
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4",
+            "key_env": "PROFILE_FALLBACK_KEY",
+        }
+        attempted_fallback = False
+
+        def fake_resolve(provider, **kwargs):
+            nonlocal attempted_fallback
+            if provider == "zai":
+                return None, None
+            attempted_fallback = True
+            return _mock_client(api_key=kwargs.get("explicit_api_key")), fallback["model"]
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve),
+            pytest.raises(RuntimeError, match="Provider 'zai'.*no API key"),
+        ):
+            AIAgent(
+                provider="zai",
+                model="primary-model",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=fallback,
+                runtime_env={},
+            )
+
+        assert attempted_fallback is False
 
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
