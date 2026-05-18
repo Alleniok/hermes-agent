@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 from typing import Any, Dict, Optional
@@ -30,7 +31,7 @@ from hermes_cli.auth import (
     has_usable_secret,
 )
 from hermes_cli.config import get_compatible_custom_providers, load_config
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, get_default_hermes_root, get_hermes_home
 from utils import base_url_host_matches, base_url_hostname
 
 
@@ -45,6 +46,66 @@ def _resolve_api_key_credentials(provider: str, env: Optional[Dict[str, Any]]) -
     if env is None:
         return resolve_api_key_provider_credentials(provider)
     return resolve_api_key_provider_credentials(provider, env=env)
+
+
+def _scoped_auth_store_allowed(env: Optional[Dict[str, Any]]) -> bool:
+    if env is None:
+        return True
+    try:
+        profile_home = get_hermes_home().resolve(strict=False)
+        default_home = get_default_hermes_root().resolve(strict=False)
+        return profile_home != default_home
+    except Exception:
+        return False
+
+
+def _load_pool_for_env(provider: str, env: Optional[Dict[str, Any]]) -> Optional[CredentialPool]:
+    if env is None:
+        return load_pool(provider)
+    if not _scoped_auth_store_allowed(env):
+        return None
+    auth_path = get_hermes_home() / "auth.json"
+    try:
+        if not auth_path.is_file():
+            return CredentialPool(provider, [])
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+        pools = data.get("credential_pool") if isinstance(data, dict) else None
+        raw_entries = pools.get(provider) if isinstance(pools, dict) else []
+        if not isinstance(raw_entries, list):
+            raw_entries = []
+        entries = [PooledCredential.from_dict(provider, entry) for entry in raw_entries]
+        return CredentialPool(provider, entries)
+    except Exception as exc:
+        logger.debug("Runtime provider: could not load scoped pool for %s: %s", provider, exc)
+        return CredentialPool(provider, [])
+
+
+def _scoped_provider_state_exists(provider: str, env: Optional[Dict[str, Any]]) -> bool:
+    if env is None:
+        return True
+    if not _scoped_auth_store_allowed(env):
+        return False
+    auth_path = get_hermes_home() / "auth.json"
+    try:
+        if not auth_path.is_file():
+            return False
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("Runtime provider: could not inspect scoped auth state for %s: %s", provider, exc)
+        return False
+    providers = data.get("providers") if isinstance(data, dict) else None
+    state = providers.get(provider) if isinstance(providers, dict) else None
+    return isinstance(state, dict) and bool(state)
+
+
+def _scoped_auth_unavailable(provider: str) -> AuthError:
+    return AuthError(
+        f"Provider '{provider}' has no profile-scoped auth credentials. "
+        "Configure credentials in the routed profile instead of relying on "
+        "gateway/global auth state.",
+        provider=provider,
+        code="no_scoped_credentials",
+    )
 
 
 def _get_named_custom_provider_for_env(
@@ -404,13 +465,14 @@ def _try_resolve_from_custom_pool(
     provider_label: str,
     api_mode_override: Optional[str] = None,
     provider_name: Optional[str] = None,
+    env: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
     pool_key = get_custom_provider_pool_key(base_url, provider_name=provider_name)
     if not pool_key:
         return None
     try:
-        pool = load_pool(pool_key)
+        pool = _load_pool_for_env(pool_key, env)
         if not pool.has_credentials():
             return None
         entry = pool.select()
@@ -473,7 +535,7 @@ def _get_named_custom_provider(
             # Match exact name or normalized name
             name_norm = _normalize_custom_provider_name(ep_name)
             # Resolve the API key from the env var name stored in key_env
-            key_env = str(entry.get("key_env", "") or "").strip()
+            key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
             resolved_api_key = _env_get(env, key_env).strip() if key_env else ""
             # Fall back to inline api_key when key_env is absent or unresolvable
             if not resolved_api_key:
@@ -489,6 +551,8 @@ def _get_named_custom_provider(
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
                     }
+                    if key_env:
+                        result["key_env"] = key_env
                     # The v11→v12 migration writes the API mode under the new
                     # ``transport`` field, but hand-edited configs may still
                     # use the legacy ``api_mode`` spelling.  Accept both —
@@ -514,6 +578,8 @@ def _get_named_custom_provider(
                             "api_key": resolved_api_key,
                             "model": entry.get("default_model", ""),
                         }
+                        if key_env:
+                            result["key_env"] = key_env
                         api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                         if api_mode:
                             result["api_mode"] = api_mode
@@ -584,7 +650,7 @@ def _resolve_named_custom_runtime(
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
-        pool_result = _try_resolve_from_custom_pool(base_url, "custom", None)
+        pool_result = _try_resolve_from_custom_pool(base_url, "custom", None, env=env)
         if pool_result:
             pool_result["source"] = "direct-alias"
             return pool_result
@@ -618,7 +684,13 @@ def _resolve_named_custom_runtime(
         return None
 
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
+    pool_result = _try_resolve_from_custom_pool(
+        base_url,
+        "custom",
+        custom_provider.get("api_mode"),
+        provider_name=custom_provider.get("name"),
+        env=env,
+    )
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -627,10 +699,22 @@ def _resolve_named_custom_runtime(
             pool_result["model"] = model_name
         return pool_result
 
+    explicit_key = (explicit_api_key or "").strip()
+    inline_key = str(custom_provider.get("api_key", "") or "").strip()
+    key_env = str(custom_provider.get("key_env", "") or "").strip()
+    key_env_value = _env_get(env, key_env).strip() if key_env else ""
+    if env is not None and key_env and not explicit_key and not inline_key and not key_env_value:
+        logger.debug(
+            "Named custom provider %s skipped: key_env %s is not present in scoped runtime env",
+            custom_provider.get("name", requested_provider),
+            key_env,
+        )
+        return None
+
     api_key_candidates = [
-        (explicit_api_key or "").strip(),
-        str(custom_provider.get("api_key", "") or "").strip(),
-        _env_get(env, str(custom_provider.get("key_env", "") or "").strip()).strip(),
+        explicit_key,
+        inline_key,
+        key_env_value,
         _env_get(env, "OPENAI_API_KEY").strip(),
         _env_get(env, "OPENROUTER_API_KEY").strip(),
     ]
@@ -743,6 +827,7 @@ def _resolve_openrouter_runtime(
         pool_result = _try_resolve_from_custom_pool(
             base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
             provider_name=requested_provider if requested_norm != "custom" else None,
+            env=env,
         )
         if pool_result:
             return pool_result
@@ -1103,7 +1188,7 @@ def resolve_runtime_provider(
         )
 
     try:
-        pool = load_pool(provider) if should_use_pool else None
+        pool = _load_pool_for_env(provider, env) if should_use_pool else None
     except Exception:
         pool = None
     if pool and pool.has_credentials():
@@ -1143,6 +1228,8 @@ def resolve_runtime_provider(
 
     if provider == "nous":
         try:
+            if not _scoped_provider_state_exists(provider, env):
+                raise _scoped_auth_unavailable(provider)
             creds = resolve_nous_runtime_credentials(
                 min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
                 timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
@@ -1166,6 +1253,8 @@ def resolve_runtime_provider(
 
     if provider == "openai-codex":
         try:
+            if not _scoped_provider_state_exists(provider, env):
+                raise _scoped_auth_unavailable(provider)
             creds = resolve_codex_runtime_credentials()
             return {
                 "provider": "openai-codex",
@@ -1186,6 +1275,8 @@ def resolve_runtime_provider(
 
     if provider == "xai-oauth":
         try:
+            if not _scoped_provider_state_exists(provider, env):
+                raise _scoped_auth_unavailable(provider)
             creds = resolve_xai_oauth_runtime_credentials()
             return {
                 "provider": "xai-oauth",
@@ -1204,6 +1295,8 @@ def resolve_runtime_provider(
 
     if provider == "qwen-oauth":
         try:
+            if not _scoped_provider_state_exists(provider, env):
+                raise _scoped_auth_unavailable(provider)
             creds = resolve_qwen_runtime_credentials()
             return {
                 "provider": "qwen-oauth",
@@ -1223,19 +1316,27 @@ def resolve_runtime_provider(
     if provider == "minimax-oauth":
         pconfig = PROVIDER_REGISTRY.get(provider)
         if pconfig and pconfig.auth_type == "oauth_minimax":
-            from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
-            creds = resolve_minimax_oauth_runtime_credentials()
-            return {
-                "provider": provider,
-                "api_mode": "anthropic_messages",
-                "base_url": creds["base_url"],
-                "api_key": creds["api_key"],
-                "source": creds.get("source", "oauth"),
-                "requested_provider": requested_provider,
-            }
+            if not _scoped_provider_state_exists(provider, env):
+                if requested_provider != "auto":
+                    raise _scoped_auth_unavailable(provider)
+                logger.info("MiniMax OAuth credentials not available in scoped profile; "
+                            "falling through to next provider.")
+            else:
+                from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+                creds = resolve_minimax_oauth_runtime_credentials()
+                return {
+                    "provider": provider,
+                    "api_mode": "anthropic_messages",
+                    "base_url": creds["base_url"],
+                    "api_key": creds["api_key"],
+                    "source": creds.get("source", "oauth"),
+                    "requested_provider": requested_provider,
+                }
 
     if provider == "google-gemini-cli":
         try:
+            if not _scoped_provider_state_exists(provider, env):
+                raise _scoped_auth_unavailable(provider)
             creds = resolve_gemini_oauth_runtime_credentials()
             return {
                 "provider": "google-gemini-cli",
@@ -1354,7 +1455,16 @@ def resolve_runtime_provider(
         # Lambda execution roles, SSO, and other implicit sources that our
         # env-var check can't detect.
         is_explicit = requested_provider in {"bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon"}
-        if not is_explicit and not has_aws_credentials():
+        scoped_aws_source = resolve_aws_auth_env_var(env) if env is not None else None
+        if env is not None and not scoped_aws_source:
+            raise AuthError(
+                "No profile-scoped AWS credentials found for Bedrock. Add AWS_ACCESS_KEY_ID + "
+                "AWS_SECRET_ACCESS_KEY, AWS_PROFILE, AWS_BEARER_TOKEN_BEDROCK, or another "
+                "Bedrock-supported AWS credential hint to the routed profile .env.",
+                provider=provider,
+                code="no_scoped_aws_credentials",
+            )
+        if env is None and not is_explicit and not has_aws_credentials():
             raise AuthError(
                 "No AWS credentials found for Bedrock. Configure one of:\n"
                 "  - AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY\n"
@@ -1366,8 +1476,8 @@ def resolve_runtime_provider(
         # Read bedrock-specific config from config.yaml
         _bedrock_cfg = load_config().get("bedrock", {})
         # Region priority: config.yaml bedrock.region → env var → us-east-1
-        region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
-        auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
+        region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region(env)
+        auth_source = scoped_aws_source or resolve_aws_auth_env_var() or "aws-sdk-default-chain"
         # Build guardrail config if configured
         _gr = _bedrock_cfg.get("guardrail", {})
         guardrail_config = None

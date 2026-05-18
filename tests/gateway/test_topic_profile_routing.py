@@ -836,6 +836,168 @@ def test_runner_fallback_normalizes_forum_general_topic_from_raw_message(tmp_pat
     assert event.source.agent_hermes_home == str(profile_home)
 
 
+def test_try_resolve_fallback_provider_uses_scoped_key_env(monkeypatch, tmp_path):
+    from gateway import run as gateway_run
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: primary-model\n"
+        "fallback_providers:\n"
+        "  - provider: openrouter\n"
+        "    model: fallback-model\n"
+        "    key_env: PROFILE_FALLBACK_KEY\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROFILE_FALLBACK_KEY", "global-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "global-openrouter")
+
+    with hermes_home_context(profile_home):
+        resolved = gateway_run._try_resolve_fallback_provider(
+            runtime_env={"PROFILE_FALLBACK_KEY": "profile-secret"}
+        )
+
+    assert resolved is not None
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_key"] == "profile-secret"
+    assert resolved["model"] == "fallback-model"
+
+
+def test_try_resolve_fallback_provider_fails_closed_when_scoped_key_env_missing(
+    monkeypatch, tmp_path
+):
+    from gateway import run as gateway_run
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: primary-model\n"
+        "fallback_providers:\n"
+        "  - provider: openrouter\n"
+        "    model: fallback-model\n"
+        "    key_env: PROFILE_FALLBACK_KEY\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROFILE_FALLBACK_KEY", "global-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "global-openrouter")
+
+    with hermes_home_context(profile_home):
+        resolved = gateway_run._try_resolve_fallback_provider(runtime_env={})
+
+    assert resolved is None
+
+
+def test_resolve_runtime_agent_kwargs_uses_scoped_fallback_when_primary_has_no_key(
+    monkeypatch, tmp_path
+):
+    from gateway import run as gateway_run
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: primary-model\n"
+        "fallback_providers:\n"
+        "  - provider: openrouter\n"
+        "    model: fallback-model\n"
+        "    key_env: PROFILE_FALLBACK_KEY\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "global-openrouter")
+    monkeypatch.setenv("PROFILE_FALLBACK_KEY", "global-fallback")
+
+    with hermes_home_context(profile_home):
+        resolved = gateway_run._resolve_runtime_agent_kwargs(
+            runtime_env={"PROFILE_FALLBACK_KEY": "profile-fallback"}
+        )
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_key"] == "profile-fallback"
+    assert resolved["model"] == "fallback-model"
+
+
+def test_resolve_runtime_agent_kwargs_fails_closed_when_scoped_primary_and_fallback_missing(
+    monkeypatch, tmp_path
+):
+    from gateway import run as gateway_run
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: primary-model\n"
+        "fallback_providers:\n"
+        "  - provider: openrouter\n"
+        "    model: fallback-model\n"
+        "    key_env: PROFILE_FALLBACK_KEY\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "global-openrouter")
+    monkeypatch.setenv("PROFILE_FALLBACK_KEY", "global-fallback")
+
+    with hermes_home_context(profile_home):
+        resolved = gateway_run._resolve_runtime_agent_kwargs(runtime_env={})
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_key"] == ""
+
+
+@pytest.mark.asyncio
+async def test_run_agent_returns_visible_auth_failure_for_routed_profile_without_credentials(
+    monkeypatch, tmp_path
+):
+    from gateway import run as gateway_run
+
+    gateway_home = tmp_path / "gateway"
+    gateway_home.mkdir()
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: routed-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "global-openrouter-should-not-be-used")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    _install_fake_agent(monkeypatch)
+
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                extra={"topic_profiles_safe_root": str(tmp_path)}
+            )
+        }
+    )
+    with hermes_home_context(gateway_home):
+        runner = _make_runner(config)
+    source = _source(
+        agent_profile="profile",
+        agent_hermes_home=str(profile_home),
+    )
+
+    with hermes_home_context(profile_home):
+        result = await runner._run_agent(
+            message="hi",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-auth-fail",
+            session_key=build_session_key(source),
+        )
+
+    assert "Provider authentication failed" in result["final_response"]
+    assert "profile-scoped provider credentials" in result["final_response"]
+    assert _CapturingAgent.last_init is None
+
+
 def test_telegram_batch_keys_are_profile_aware_from_event(tmp_path):
     pytest.importorskip("telegram")
     from gateway.platforms.telegram import TelegramAdapter
@@ -1671,10 +1833,36 @@ def test_agent_cache_signature_changes_when_profile_prompt_provider_or_prefill_c
             ),
         },
     )
+    changed_fallback = GatewayRunner._agent_config_signature(
+        "model-a",
+        runtime,
+        ["web"],
+        "prompt-a",
+        cache_keys={
+            **base_keys,
+            "fallback.digest": GatewayRunner._stable_config_digest(
+                [{"provider": "openrouter", "model": "fallback-b"}]
+            ),
+        },
+    )
+    changed_runtime_env = GatewayRunner._agent_config_signature(
+        "model-a",
+        runtime,
+        ["web"],
+        "prompt-a",
+        cache_keys={
+            **base_keys,
+            "runtime_env.digest": GatewayRunner._stable_config_digest(
+                {"PROFILE_FALLBACK_KEY": "fallback-b"}
+            ),
+        },
+    )
 
     assert changed_prompt != base
     assert changed_provider != base
     assert changed_prefill != base
+    assert changed_fallback != base
+    assert changed_runtime_env != base
 
 
 def test_agent_cache_signature_changes_when_profile_home_or_soul_changes(tmp_path):
@@ -1772,6 +1960,82 @@ async def test_routed_profile_soul_change_busts_cached_agent(monkeypatch, tmp_pa
 
     assert len(_CapturingAgent.inits) == 2
     assert _CapturingAgent.inits[-1]["soul"] == "Profile SOUL after first turn"
+
+
+@pytest.mark.asyncio
+async def test_routed_profile_runtime_env_change_busts_cached_agent(monkeypatch, tmp_path):
+    gateway_home = tmp_path / "gateway"
+    profiles_root = gateway_home / "profiles"
+    profile_home = profiles_root / "cybrel-test"
+    profile_home.mkdir(parents=True)
+    _write_profile_config(profile_home, prompt="Profile prompt", model="profile-model", toolsets=["web"])
+    profile_cfg = (profile_home / "config.yaml").read_text(encoding="utf-8")
+    (profile_home / "config.yaml").write_text(
+        profile_cfg
+        + "fallback_providers:\n"
+        + "  - provider: openrouter\n"
+        + "    model: anthropic/claude-sonnet-4\n"
+        + "    key_env: PROFILE_FALLBACK_KEY\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text(
+        "OPENROUTER_API_KEY=stable-primary\nPROFILE_FALLBACK_KEY=fallback-one\n",
+        encoding="utf-8",
+    )
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                extra={"topic_profiles_safe_root": str(profiles_root)}
+            )
+        }
+    )
+
+    with hermes_home_context(gateway_home):
+        runner = _make_runner(config)
+    source = _source(agent_profile="cybrel-test", agent_hermes_home=str(profile_home))
+
+    _install_fake_agent(monkeypatch)
+    monkeypatch.delenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", raising=False)
+    monkeypatch.delenv("HERMES_PREFILL_MESSAGES_FILE", raising=False)
+    from gateway import run as gateway_run
+
+    def stable_primary_runtime(runtime_env=None):
+        return {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "stable-primary",
+        }
+
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", stable_primary_runtime)
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+
+    with hermes_home_context(profile_home):
+        await runner._run_agent(
+            message="hi",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id=f"session-{source.thread_id or 'main'}",
+            session_key=build_session_key(source),
+        )
+    (profile_home / ".env").write_text(
+        "OPENROUTER_API_KEY=stable-primary\nPROFILE_FALLBACK_KEY=fallback-two\n",
+        encoding="utf-8",
+    )
+    with hermes_home_context(profile_home):
+        await runner._run_agent(
+            message="hi",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id=f"session-{source.thread_id or 'main'}",
+            session_key=build_session_key(source),
+        )
+
+    assert len(_CapturingAgent.inits) == 2
+    assert _CapturingAgent.inits[0]["runtime_env"]["PROFILE_FALLBACK_KEY"] == "fallback-one"
+    assert _CapturingAgent.inits[1]["runtime_env"]["PROFILE_FALLBACK_KEY"] == "fallback-two"
 
 
 @pytest.mark.asyncio

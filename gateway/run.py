@@ -703,11 +703,29 @@ def _resolve_runtime_agent_kwargs(runtime_env: Optional[dict] = None) -> dict:
     )
     from hermes_cli.auth import AuthError
 
+    def _runtime_has_credentials(runtime: dict) -> bool:
+        try:
+            from hermes_cli.auth import has_usable_secret
+        except Exception:
+            has_usable_secret = lambda value: bool(str(value or "").strip())  # type: ignore[assignment]
+
+        api_key = str(runtime.get("api_key") or "").strip()
+        return bool(
+            runtime.get("credential_pool")
+            or runtime.get("command")
+            or api_key == "no-key-required"
+            or has_usable_secret(api_key)
+        )
+
     try:
         runtime_kwargs = {"requested": _env_get(runtime_env, "HERMES_INFERENCE_PROVIDER")}
         if runtime_env is not None:
             runtime_kwargs["env"] = runtime_env
         runtime = resolve_runtime_provider(**runtime_kwargs)
+        if not _runtime_has_credentials(runtime):
+            fb_config = _try_resolve_fallback_provider(runtime_env=runtime_env)
+            if fb_config is not None:
+                return fb_config
     except AuthError as auth_exc:
         # Primary provider auth failed (expired token, revoked key, etc.).
         # Try the fallback provider chain before raising.
@@ -751,14 +769,42 @@ def _try_resolve_fallback_provider(runtime_env: Optional[dict] = None) -> dict |
             if not isinstance(entry, dict):
                 continue
             try:
+                explicit_api_key = entry.get("api_key")
+                if not explicit_api_key:
+                    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+                    if key_env:
+                        explicit_api_key = _env_get(runtime_env, key_env).strip() or None
+                        if runtime_env is not None and not explicit_api_key:
+                            logger.debug(
+                                "Fallback entry %s skipped: key_env %s is not present in scoped runtime env",
+                                entry.get("provider"),
+                                key_env,
+                            )
+                            continue
                 runtime_args = {
                     "requested": entry.get("provider"),
                     "explicit_base_url": entry.get("base_url"),
-                    "explicit_api_key": entry.get("api_key"),
+                    "explicit_api_key": explicit_api_key,
                 }
                 if runtime_env is not None:
                     runtime_args["env"] = runtime_env
                 runtime = resolve_runtime_provider(**runtime_args)
+                try:
+                    from hermes_cli.auth import has_usable_secret
+                except Exception:
+                    has_usable_secret = lambda value: bool(str(value or "").strip())  # type: ignore[assignment]
+                api_key = str(runtime.get("api_key") or "").strip()
+                if not (
+                    runtime.get("credential_pool")
+                    or runtime.get("command")
+                    or api_key == "no-key-required"
+                    or has_usable_secret(api_key)
+                ):
+                    logger.debug(
+                        "Fallback entry %s skipped: no usable scoped credentials resolved",
+                        entry.get("provider"),
+                    )
+                    continue
                 logger.info(
                     "Fallback provider resolved: %s model=%s",
                     runtime.get("provider"),
@@ -16060,6 +16106,11 @@ class GatewayRunner:
             cache_keys["prefill_messages.digest"] = self._stable_config_digest(
                 turn_prefill_messages or []
             )
+            cache_keys["fallback.digest"] = self._stable_config_digest(
+                user_config.get("fallback_providers") or user_config.get("fallback_model")
+            )
+            if runtime_env is not None:
+                cache_keys["runtime_env.digest"] = self._stable_config_digest(runtime_env)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -16686,6 +16737,7 @@ class GatewayRunner:
                             "api_key": getattr(agent, "api_key", None),
                             "api_mode": getattr(agent, "api_mode", None),
                         } if agent else None,
+                        "env": getattr(agent, "_runtime_env", None) if agent else None,
                     }
                     if self._is_telegram_topic_lane(source):
                         maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(

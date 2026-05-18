@@ -25,6 +25,7 @@ import ssl
 import threading
 import time
 import uuid
+from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from agent.anthropic_adapter import _is_oauth_token
@@ -231,7 +232,6 @@ def run_conversation(
         )
     except Exception:
         pass
-
     # Tag all log records on this thread with the session ID so
     # ``hermes logs --session <id>`` can filter a single conversation.
     from hermes_logging import set_session_context
@@ -4079,6 +4079,33 @@ def run_conversation(
 
     return result
 
+
+
+_run_conversation_impl = run_conversation
+
+
+@wraps(_run_conversation_impl)
+def run_conversation(*args, **kwargs):
+    """Bind profile-scoped runtime env for one agent turn and restore it."""
+    agent = args[0] if args else kwargs.get("agent")
+    runtime_env_token = None
+    clear_runtime_env = None
+    try:
+        from gateway.session_context import clear_runtime_env, set_runtime_env
+        runtime_env_token = set_runtime_env(
+            getattr(agent, "_runtime_env", None) if agent is not None else None
+        )
+    except Exception:
+        runtime_env_token = None
+        clear_runtime_env = None
+    try:
+        return _run_conversation_impl(*args, **kwargs)
+    finally:
+        if runtime_env_token is not None and clear_runtime_env is not None:
+            try:
+                clear_runtime_env(runtime_env_token)
+            except Exception:
+                pass
 
 
 __all__ = ["run_conversation"]

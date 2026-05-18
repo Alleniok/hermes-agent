@@ -37,7 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -58,6 +58,7 @@ _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
 _SESSION_AGENT_PROFILE: ContextVar = ContextVar("HERMES_SESSION_AGENT_PROFILE", default=_UNSET)
 _SESSION_AGENT_HERMES_HOME: ContextVar = ContextVar("HERMES_SESSION_AGENT_HERMES_HOME", default=_UNSET)
+_SESSION_RUNTIME_ENV: ContextVar = ContextVar("HERMES_SESSION_RUNTIME_ENV", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -141,6 +142,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_AGENT_HERMES_HOME,
     ):
         var.set("")
+    _SESSION_RUNTIME_ENV.set({})
 
 
 def get_session_env(name: str, default: str = "") -> str:
@@ -167,3 +169,32 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def set_runtime_env(runtime_env: Optional[dict[str, Any]]) -> Any:
+    """Set the current turn's scoped runtime env and return a reset token."""
+    value = None if runtime_env is None else dict(runtime_env)
+    return _SESSION_RUNTIME_ENV.set(value)
+
+
+def clear_runtime_env(token: Any = None) -> None:
+    """Clear the runtime env without falling back to process-global secrets."""
+    if token is not None:
+        try:
+            _SESSION_RUNTIME_ENV.reset(token)
+            return
+        except Exception:
+            pass
+    _SESSION_RUNTIME_ENV.set({})
+
+
+def get_runtime_env(default: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+    """Return the scoped runtime env for this context, if one was set."""
+    value = _SESSION_RUNTIME_ENV.get()
+    if value is _UNSET:
+        return default
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    return default

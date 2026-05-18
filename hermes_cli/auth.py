@@ -610,19 +610,22 @@ def _resolve_api_key_provider_secret(
         if has_usable_secret(val):
             return val, env_var
 
-    # Fallback: try credential pool (e.g. zai key stored via auth.json)
-    try:
-        from agent.credential_pool import load_pool
-        pool = load_pool(provider_id)
-        if pool and pool.has_credentials():
-            entry = pool.peek()
-            if entry:
-                key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
-                key = str(key).strip()
-                if has_usable_secret(key):
-                    return key, f"credential_pool:{provider_id}"
-    except Exception:
-        pass
+    # Fallback: try credential pool (e.g. zai key stored via auth.json).
+    # Scoped callers pass an explicit env mapping; they must not inherit the
+    # process/global pool after their scoped env misses.
+    if env is None:
+        try:
+            from agent.credential_pool import load_pool
+            pool = load_pool(provider_id)
+            if pool and pool.has_credentials():
+                entry = pool.peek()
+                if entry:
+                    key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
+                    key = str(key).strip()
+                    if has_usable_secret(key):
+                        return key, f"credential_pool:{provider_id}"
+        except Exception:
+            pass
 
     return "", ""
 

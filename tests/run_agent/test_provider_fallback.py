@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_constants import hermes_home_context
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -359,12 +360,108 @@ class TestFallbackChainAdvancement:
         with (
             patch.dict(os.environ, {"OPENROUTER_API_KEY": "global-openrouter"}, clear=False),
             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("agent.auxiliary_client._mark_provider_unhealthy"),
             patch("agent.credential_pool.load_pool", return_value=None),
             patch("agent.auxiliary_client.OpenAI") as mock_openai,
         ):
             assert agent._try_activate_fallback() is False
 
         mock_openai.assert_not_called()
+
+    def test_runtime_auto_fallback_ignores_global_env_when_profile_env_empty(self):
+        fbs = [{"provider": "auto", "model": "anthropic/claude-sonnet-4"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {}
+
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "global-openrouter"}, clear=False),
+            patch("agent.auxiliary_client._read_main_provider", return_value=""),
+            patch("agent.auxiliary_client._read_main_model", return_value=""),
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("agent.auxiliary_client._mark_provider_unhealthy"),
+            patch("agent.auxiliary_client._try_nous", return_value=(None, None)),
+            patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)),
+            patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            assert agent._try_activate_fallback() is False
+
+        mock_openai.assert_not_called()
+
+    def test_runtime_auto_fallback_uses_profile_env_openrouter_key(self):
+        fbs = [{"provider": "auto", "model": "anthropic/claude-sonnet-4"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {"OPENROUTER_API_KEY": "profile-openrouter"}
+
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "global-openrouter"}, clear=False),
+            patch("agent.auxiliary_client._read_main_provider", return_value=""),
+            patch("agent.auxiliary_client._read_main_model", return_value=""),
+            patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False),
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("agent.auxiliary_client._try_nous", return_value=(None, None)),
+            patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)),
+            patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value.base_url = "https://openrouter.ai/api/v1"
+            mock_openai.return_value.api_key = "profile-openrouter"
+            assert agent._try_activate_fallback() is True
+
+        assert mock_openai.call_args.kwargs["api_key"] == "profile-openrouter"
+        assert agent.api_key == "profile-openrouter"
+
+    def test_runtime_named_custom_fallback_uses_profile_key_env(self, tmp_path):
+        home = tmp_path / "profile"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "providers:\n"
+            "  profile-local:\n"
+            "    base_url: http://127.0.0.1:1234/v1\n"
+            "    key_env: PROFILE_FALLBACK_KEY\n"
+            "    default_model: fallback-model\n",
+            encoding="utf-8",
+        )
+        fbs = [{"provider": "profile-local", "model": "fallback-model"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {"PROFILE_FALLBACK_KEY": "profile-secret"}
+
+        with (
+            hermes_home_context(home),
+            patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value.base_url = "http://127.0.0.1:1234/v1"
+            mock_openai.return_value.api_key = "profile-secret"
+            assert agent._try_activate_fallback() is True
+
+        assert mock_openai.call_args.kwargs["api_key"] == "profile-secret"
+        assert agent.api_key == "profile-secret"
+
+    def test_runtime_named_custom_fallback_ignores_global_key_env_when_profile_env_empty(self, tmp_path):
+        home = tmp_path / "profile"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "providers:\n"
+            "  profile-local:\n"
+            "    base_url: http://127.0.0.1:1234/v1\n"
+            "    key_env: PROFILE_FALLBACK_KEY\n"
+            "    default_model: fallback-model\n",
+            encoding="utf-8",
+        )
+        fbs = [{"provider": "profile-local", "model": "fallback-model"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {}
+
+        with (
+            hermes_home_context(home),
+            patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            assert agent._try_activate_fallback() is False
+
+        mock_openai.assert_not_called()
+        assert agent.api_key == "test-key"
 
     def test_runtime_custom_ollama_fallback_requires_profile_ollama_key(self):
         fbs = [

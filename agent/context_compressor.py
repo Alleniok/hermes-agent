@@ -1050,6 +1050,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     "api_key": self.api_key,
                     "api_mode": self.api_mode,
                 },
+                "env": getattr(self, "runtime_env", None),
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(summary_budget * 1.3),
                 # timeout resolved from auxiliary.compression.timeout config by call_llm

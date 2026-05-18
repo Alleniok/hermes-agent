@@ -1331,6 +1331,10 @@ def init_agent(
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
+    try:
+        agent.context_compressor.runtime_env = getattr(agent, "_runtime_env", None)
+    except Exception:
+        pass
     agent.compression_enabled = compression_enabled
 
     # Reject models whose context window is below the minimum required
