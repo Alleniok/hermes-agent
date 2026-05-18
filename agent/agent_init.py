@@ -698,6 +698,7 @@ def init_agent(
                     _fb_resolved = False
                     for _fb in _fb_entries:
                         _fb_explicit_key = (_fb.get("api_key") or "").strip() or None
+                        _fb_key_env = ""
                         if not _fb_explicit_key:
                             _fb_key_env = (_fb.get("key_env") or _fb.get("api_key_env") or "").strip()
                             if _fb_key_env:
@@ -706,11 +707,23 @@ def init_agent(
                                 else:
                                     _fb_explicit_key = str(runtime_env.get(_fb_key_env, "")).strip() or None
                         if runtime_env is not None and not _fb_explicit_key:
+                            _fb_env_names = []
                             if _fb["provider"] == "ollama":
-                                _fb_explicit_key = str(runtime_env.get("OLLAMA_API_KEY", "")).strip() or None
-                            else:
-                                _fb_env_name = f"{str(_fb['provider']).upper().replace('-', '_')}_API_KEY"
+                                _fb_env_names.append("OLLAMA_API_KEY")
+                            try:
+                                from hermes_cli.auth import PROVIDER_REGISTRY as _fb_registry
+                                _fb_pcfg = _fb_registry.get(str(_fb["provider"]))
+                                if _fb_pcfg and _fb_pcfg.api_key_env_vars:
+                                    _fb_env_names.extend(_fb_pcfg.api_key_env_vars)
+                            except Exception:
+                                _fb_pcfg = None
+                            _fb_env_names.append(f"{str(_fb['provider']).upper().replace('-', '_')}_API_KEY")
+                            for _fb_env_name in _fb_env_names:
                                 _fb_explicit_key = str(runtime_env.get(_fb_env_name, "")).strip() or None
+                                if _fb_explicit_key:
+                                    break
+                            if not _fb_explicit_key and (_fb_key_env or getattr(_fb_pcfg, "auth_type", None) == "api_key"):
+                                continue
                         _fb_client, _fb_model = resolve_provider_client(
                             _fb["provider"], model=_fb["model"], raw_codex=True,
                             explicit_base_url=_fb.get("base_url"),
