@@ -257,6 +257,89 @@ class TestFallbackChainAdvancement:
 
         assert attempted_fallback is False
 
+    def test_runtime_fallback_uses_profile_runtime_env_key_env(self):
+        """Runtime fallback must use the routed profile env, not process env."""
+        fbs = [
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+                "key_env": "PROFILE_FALLBACK_KEY",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {"PROFILE_FALLBACK_KEY": "profile-secret"}
+
+        with (
+            patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(api_key="profile-secret"), fbs[0]["model"]),
+            ) as mock_rpc,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert mock_rpc.call_args.kwargs["explicit_api_key"] == "profile-secret"
+        assert agent.api_key == "profile-secret"
+
+    def test_runtime_fallback_fails_closed_without_profile_key(self):
+        """A routed profile must not activate fallback using global env keys."""
+        fbs = [
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+                "key_env": "PROFILE_FALLBACK_KEY",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {}
+
+        with (
+            patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
+            patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc,
+        ):
+            assert agent._try_activate_fallback() is False
+
+        mock_rpc.assert_not_called()
+
+    def test_runtime_fallback_skips_missing_profile_key_and_tries_next_entry(self):
+        fbs = [
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+                "key_env": "PROFILE_FALLBACK_KEY",
+            },
+            {
+                "provider": "custom",
+                "model": "fallback-model",
+                "base_url": "https://fallback.example/v1",
+                "api_key": "explicit-second-key",
+            },
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {}
+
+        with (
+            patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(
+                        base_url="https://fallback.example/v1",
+                        api_key="explicit-second-key",
+                    ),
+                    "fallback-model",
+                ),
+            ) as mock_rpc,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert mock_rpc.call_count == 1
+        assert mock_rpc.call_args.args[:2] == ("custom",)
+        assert mock_rpc.call_args.kwargs["explicit_api_key"] == "explicit-second-key"
+        assert "global-secret" not in {
+            call.kwargs.get("explicit_api_key") for call in mock_rpc.call_args_list
+        }
+
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
 
