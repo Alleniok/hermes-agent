@@ -69,6 +69,13 @@ if TYPE_CHECKING:
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
+def _env_lookup(env: Optional[Dict[str, Any]], key: str, default: str = "") -> str:
+    if env is None:
+        return os.getenv(key, default)
+    value = env.get(key, default)
+    return "" if value is None else str(value)
+
+
 def _load_openai_cls() -> type:
     """Import and cache ``openai.OpenAI``."""
     global _OPENAI_CLS_CACHE
@@ -1373,7 +1380,7 @@ def _read_codex_access_token() -> Optional[str]:
         return None
 
 
-def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
+def _resolve_api_key_provider(env: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Try each API-key provider in PROVIDER_REGISTRY order.
 
     Returns (client, model) for the first provider with usable runtime
@@ -1398,7 +1405,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                     continue
             except ImportError:
                 pass
-            return _try_anthropic()
+                return _try_anthropic(env=env)
 
         pool_present, entry = _select_pool_entry(provider_id)
         if pool_present:
@@ -1438,7 +1445,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
             return _client, model
 
-        creds = resolve_api_key_provider_credentials(provider_id)
+        creds = resolve_api_key_provider_credentials(provider_id, env=env)
         api_key = str(creds.get("api_key", "")).strip()
         if not api_key:
             continue
@@ -1482,7 +1489,11 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 
-def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_openrouter(
+    explicit_api_key: str = None,
+    model: str = None,
+    env: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
         or_key = explicit_api_key or _pool_runtime_api_key(entry)
@@ -1494,7 +1505,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
         return OpenAI(api_key=or_key, base_url=base_url,
                        default_headers=build_or_headers()), model or _OPENROUTER_MODEL
 
-    or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
+    or_key = explicit_api_key or _env_lookup(env, "OPENROUTER_API_KEY").strip()
     if not or_key:
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
@@ -1678,7 +1689,7 @@ def clear_runtime_main() -> None:
     _RUNTIME_MAIN_MODEL = ""
 
 
-def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _resolve_custom_runtime(env: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Resolve the active custom/main endpoint the same way the main CLI does.
 
     This covers both env-driven OPENAI_BASE_URL setups and config-saved custom
@@ -1688,14 +1699,14 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        runtime = resolve_runtime_provider(requested="custom")
+        runtime = resolve_runtime_provider(requested="custom", env=env)
     except Exception as exc:
         logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
         runtime = None
 
     if not isinstance(runtime, dict):
-        openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        openai_base = _env_lookup(env, "OPENAI_BASE_URL").strip().rstrip("/")
+        openai_key = _env_lookup(env, "OPENAI_API_KEY").strip()
         if not openai_base:
             return None, None, None
         runtime = {
@@ -1780,8 +1791,8 @@ def _validate_base_url(base_url: str) -> None:
         ) from exc
 
 
-def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
-    runtime = _resolve_custom_runtime()
+def _try_custom_endpoint(env: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+    runtime = _resolve_custom_runtime(env=env)
     if len(runtime) == 2:
         custom_base, custom_key = runtime
         custom_mode = None
@@ -1891,7 +1902,10 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
     return CodexAuxiliaryClient(real_client, model), model
 
 
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+def _try_anthropic(
+    explicit_api_key: str = None,
+    env: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
@@ -1904,7 +1918,19 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         token = explicit_api_key or _pool_runtime_api_key(entry)
     else:
         entry = None
-        token = explicit_api_key or resolve_anthropic_token()
+        token = explicit_api_key
+        if not token:
+            if env is None:
+                token = resolve_anthropic_token()
+            else:
+                try:
+                    from hermes_cli.auth import PROVIDER_REGISTRY
+                    for env_name in PROVIDER_REGISTRY["anthropic"].api_key_env_vars:
+                        token = _env_lookup(env, env_name).strip()
+                        if token:
+                            break
+                except Exception:
+                    token = ""
     if not token:
         return None, None
 
@@ -2931,6 +2957,7 @@ def resolve_provider_client(
     explicit_api_key: str = None,
     api_mode: str = None,
     main_runtime: Optional[Dict[str, Any]] = None,
+    env: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
@@ -3042,7 +3069,7 @@ def resolve_provider_client(
 
     # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
+        client, default = _try_openrouter(explicit_api_key=explicit_api_key, env=env)
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
@@ -3128,17 +3155,21 @@ def resolve_provider_client(
     if provider == "custom":
         if explicit_base_url:
             custom_base = _to_openai_base_url(explicit_base_url).strip()
-            custom_key = (
-                (explicit_api_key or "").strip()
-                or os.getenv("OPENAI_API_KEY", "").strip()
-                or "no-key-required"  # local servers don't need auth
-            )
+            custom_key = (explicit_api_key or "").strip()
             if not custom_base:
                 logger.warning(
                     "resolve_provider_client: explicit custom endpoint requested "
                     "but base_url is empty"
                 )
                 return None, None
+            if not custom_key and base_url_host_matches(custom_base, "ollama.com"):
+                custom_key = _env_lookup(env, "OLLAMA_API_KEY").strip()
+            if not custom_key:
+                custom_key = _env_lookup(env, "OPENAI_API_KEY").strip()
+            if not custom_key:
+                if base_url_host_matches(custom_base, "ollama.com"):
+                    return None, None
+                custom_key = "no-key-required"  # local servers don't need auth
             final_model = _normalize_resolved_model(
                 model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini",
                 provider,
@@ -3173,7 +3204,7 @@ def resolve_provider_client(
         # Try custom first, then API-key providers (Codex excluded here:
         # falling through to Codex with no model is a stale-constant trap).
         for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
-            client, default = try_fn()
+            client, default = try_fn(env=env)
             if client is not None:
                 final_model = _normalize_resolved_model(model or default, provider)
                 _cbase = str(getattr(client, "base_url", "") or "")
@@ -3205,7 +3236,7 @@ def resolve_provider_client(
             custom_key = custom_entry.get("api_key", "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
-                custom_key = os.getenv(custom_key_env, "").strip()
+                custom_key = _env_lookup(env, custom_key_env).strip()
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
@@ -3307,14 +3338,14 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
-            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
+            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key, env=env)
             if client is None:
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None
             final_model = _normalize_resolved_model(model or default_model, provider)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode else (client, final_model))
 
-        creds = resolve_api_key_provider_credentials(provider)
+        creds = resolve_api_key_provider_credentials(provider, env=env)
         api_key = str(creds.get("api_key", "")).strip()
         # Honour an explicit api_key override (e.g. from a fallback_model entry
         # or a custom_providers entry) so callers that pass an explicit

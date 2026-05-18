@@ -235,7 +235,9 @@ class TestFallbackChainAdvancement:
             if provider == "zai":
                 return None, None
             attempted_fallback = True
-            return _mock_client(api_key=kwargs.get("explicit_api_key")), fallback["model"]
+            assert kwargs.get("env") == {}
+            assert kwargs.get("explicit_api_key") in {None, ""}
+            return None, None
 
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
@@ -255,7 +257,7 @@ class TestFallbackChainAdvancement:
                 runtime_env={},
             )
 
-        assert attempted_fallback is False
+        assert attempted_fallback is True
 
     def test_runtime_fallback_uses_profile_runtime_env_key_env(self):
         """Runtime fallback must use the routed profile env, not process env."""
@@ -295,11 +297,12 @@ class TestFallbackChainAdvancement:
 
         with (
             patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
-            patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc,
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)) as mock_rpc,
         ):
             assert agent._try_activate_fallback() is False
 
-        mock_rpc.assert_not_called()
+        assert mock_rpc.call_args.kwargs["env"] == {}
+        assert mock_rpc.call_args.kwargs["explicit_api_key"] in {None, ""}
 
     def test_runtime_fallback_skips_missing_profile_key_and_tries_next_entry(self):
         fbs = [
@@ -318,27 +321,69 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=fbs)
         agent._runtime_env = {}
 
+        def fake_resolve(provider, **kwargs):
+            if provider == "openrouter":
+                assert kwargs.get("env") == {}
+                assert kwargs.get("explicit_api_key") in {None, ""}
+                return None, None
+            assert provider == "custom"
+            return (
+                _mock_client(
+                    base_url="https://fallback.example/v1",
+                    api_key="explicit-second-key",
+                ),
+                "fallback-model",
+            )
+
         with (
             patch.dict(os.environ, {"PROFILE_FALLBACK_KEY": "global-secret"}, clear=False),
             patch(
                 "agent.auxiliary_client.resolve_provider_client",
-                return_value=(
-                    _mock_client(
-                        base_url="https://fallback.example/v1",
-                        api_key="explicit-second-key",
-                    ),
-                    "fallback-model",
-                ),
+                side_effect=fake_resolve,
             ) as mock_rpc,
         ):
             assert agent._try_activate_fallback() is True
 
-        assert mock_rpc.call_count == 1
+        assert mock_rpc.call_count == 2
         assert mock_rpc.call_args.args[:2] == ("custom",)
         assert mock_rpc.call_args.kwargs["explicit_api_key"] == "explicit-second-key"
         assert "global-secret" not in {
             call.kwargs.get("explicit_api_key") for call in mock_rpc.call_args_list
         }
+
+    def test_runtime_bare_openrouter_fallback_ignores_global_env_when_profile_env_empty(self):
+        fbs = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {}
+
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "global-openrouter"}, clear=False),
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("agent.credential_pool.load_pool", return_value=None),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            assert agent._try_activate_fallback() is False
+
+        mock_openai.assert_not_called()
+
+    def test_runtime_custom_ollama_fallback_requires_profile_ollama_key(self):
+        fbs = [
+            {
+                "provider": "custom",
+                "model": "nemotron-3-nano:30b",
+                "base_url": "https://ollama.com/v1",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._runtime_env = {}
+
+        with (
+            patch.dict(os.environ, {"OPENAI_API_KEY": "global-openai"}, clear=False),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            assert agent._try_activate_fallback() is False
+
+        mock_openai.assert_not_called()
 
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────

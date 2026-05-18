@@ -652,7 +652,8 @@ def init_agent(
             # No explicit creds — use the centralized provider router
             from agent.auxiliary_client import resolve_provider_client
             _routed_client, _ = resolve_provider_client(
-                agent.provider or "auto", model=agent.model, raw_codex=True)
+                agent.provider or "auto", model=agent.model, raw_codex=True,
+                env=runtime_env)
             if _routed_client is not None:
                 client_kwargs = {
                     "api_key": _routed_client.api_key,
@@ -708,7 +709,8 @@ def init_agent(
                                     _fb_explicit_key = str(runtime_env.get(_fb_key_env, "")).strip() or None
                         if runtime_env is not None and not _fb_explicit_key:
                             _fb_env_names = []
-                            if _fb["provider"] == "ollama":
+                            _fb_base_url = (_fb.get("base_url") or "").strip()
+                            if _fb["provider"] == "ollama" or base_url_host_matches(_fb_base_url, "ollama.com"):
                                 _fb_env_names.append("OLLAMA_API_KEY")
                             try:
                                 from hermes_cli.auth import PROVIDER_REGISTRY as _fb_registry
@@ -722,12 +724,11 @@ def init_agent(
                                 _fb_explicit_key = str(runtime_env.get(_fb_env_name, "")).strip() or None
                                 if _fb_explicit_key:
                                     break
-                            if not _fb_explicit_key and (_fb_key_env or getattr(_fb_pcfg, "auth_type", None) == "api_key"):
-                                continue
                         _fb_client, _fb_model = resolve_provider_client(
                             _fb["provider"], model=_fb["model"], raw_codex=True,
                             explicit_base_url=_fb.get("base_url"),
                             explicit_api_key=_fb_explicit_key,
+                            env=runtime_env,
                         )
                         if _fb_client is not None:
                             agent.provider = _fb["provider"]

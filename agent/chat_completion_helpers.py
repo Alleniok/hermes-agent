@@ -760,16 +760,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                         break
             except Exception:
                 fb_provider_config = None
-            if not fb_api_key_hint and (fb_key_env or getattr(fb_provider_config, "auth_type", None) == "api_key"):
-                logging.warning(
-                    "Fallback to %s skipped: provider key not present in profile runtime env",
-                    fb_provider,
-                )
-                return agent._try_activate_fallback()
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
-            explicit_api_key=fb_api_key_hint)
+            explicit_api_key=fb_api_key_hint,
+            env=runtime_env)
         if fb_client is None:
             logging.warning(
                 "Fallback to %s failed: provider not configured",
