@@ -7843,7 +7843,7 @@ class GatewayRunner:
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            session_info = self._format_session_info(source)
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -8739,7 +8739,7 @@ class GatewayRunner:
             if _profile_home_token is not None:
                 reset_hermes_home_override(_profile_home_token)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -8748,17 +8748,89 @@ class GatewayRunner:
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        def _providers_equivalent(config_provider: Optional[str], runtime_provider: Optional[str]) -> bool:
+            configured = (config_provider or "").strip().lower()
+            runtime_name = (runtime_provider or "").strip().lower()
+            if not configured or not runtime_name:
+                return False
+            if configured == runtime_name:
+                return True
+            return configured.startswith("custom:") and runtime_name == "custom"
+
+        profile_home = None
+        runtime_env = None
+        if source is not None:
+            profile_home = self._profile_home_for_source(source)
+            if profile_home is not None:
+                try:
+                    from hermes_cli.env_loader import read_hermes_dotenv_values
+                    runtime_env = read_hermes_dotenv_values(hermes_home=profile_home)
+                except Exception as exc:
+                    logger.debug(
+                        "Could not read routed profile runtime env for session info: %s",
+                        exc,
+                    )
+                    runtime_env = {}
+
+        data = _load_gateway_config(profile_home) if profile_home is not None else _load_gateway_config(_hermes_home)
+        configured_model = _resolve_gateway_model(data)
+        model = configured_model
         config_context_length = None
+        config_provider = None
+        config_base_url = None
         provider = None
         base_url = None
         api_key = None
         custom_provs = None
-        data = None
 
         try:
-            data = _load_gateway_config()
             if data:
+                model_cfg = data.get("model", {})
+                if isinstance(model_cfg, dict):
+                    config_provider = model_cfg.get("provider") or None
+                    config_base_url = model_cfg.get("base_url") or None
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers
+                    custom_provs = get_compatible_custom_providers(data)
+                except Exception:
+                    custom_provs = data.get("custom_providers")
+        except Exception:
+            pass
+
+        # Resolve runtime credentials for probing. For routed profiles, keep
+        # all config/auth/fallback lookup under the profile's Hermes home so
+        # global gateway credentials cannot leak into the displayed session.
+        try:
+            if source is not None:
+                if profile_home is not None:
+                    with hermes_home_context(profile_home):
+                        model, runtime = self._resolve_session_agent_runtime(
+                            source=source,
+                            user_config=data,
+                            runtime_env=runtime_env,
+                        )
+                else:
+                    model, runtime = self._resolve_session_agent_runtime(
+                        source=source,
+                        user_config=data,
+                        runtime_env=runtime_env,
+                    )
+            else:
+                runtime = _resolve_runtime_agent_kwargs()
+            runtime_provider = runtime.get("provider")
+            provider = (
+                config_provider
+                if _providers_equivalent(config_provider, runtime_provider)
+                else (runtime_provider or config_provider)
+            )
+            base_url = runtime.get("base_url") or config_base_url
+            api_key = runtime.get("api_key")
+        except Exception:
+            provider = config_provider
+            base_url = config_base_url
+
+        try:
+            if data and model == configured_model:
                 model_cfg = data.get("model", {})
                 if isinstance(model_cfg, dict):
                     raw_ctx = model_cfg.get("context_length")
@@ -8767,13 +8839,6 @@ class GatewayRunner:
                             config_context_length = int(raw_ctx)
                         except (TypeError, ValueError):
                             pass
-                    provider = model_cfg.get("provider") or None
-                    base_url = model_cfg.get("base_url") or None
-                try:
-                    from hermes_cli.config import get_compatible_custom_providers
-                    custom_provs = get_compatible_custom_providers(data)
-                except Exception:
-                    custom_provs = data.get("custom_providers")
         except Exception:
             pass
 
@@ -8811,15 +8876,6 @@ class GatewayRunner:
                                     pass
             except Exception:
                 pass
-
-        # Resolve runtime credentials for probing
-        try:
-            runtime = _resolve_runtime_agent_kwargs()
-            provider = provider or runtime.get("provider")
-            base_url = base_url or runtime.get("base_url")
-            api_key = runtime.get("api_key")
-        except Exception:
-            pass
 
         context_length = get_model_context_length(
             model,
@@ -8943,7 +8999,7 @@ class GatewayRunner:
 
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(source)
         except Exception:
             session_info = ""
 

@@ -2071,6 +2071,175 @@ async def test_reset_command_uses_profile_session_store_for_routed_topic(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_reset_command_displays_routed_profile_model_info(tmp_path):
+    from gateway import run as gateway_run
+
+    gateway_home = tmp_path / "gateway"
+    profiles_root = gateway_home / "profiles"
+    profile_home = profiles_root / "cybrel-test"
+    profile_home.mkdir(parents=True)
+    gateway_home.mkdir(exist_ok=True)
+    (gateway_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openai-codex\n"
+        "  default: gpt-5.5\n"
+        "  context_length: 272000\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom:vibeproxy\n"
+        "  default: claude-opus-4-7\n"
+        "custom_providers:\n"
+        "  - name: vibeproxy\n"
+        "    base_url: http://127.0.0.1:8318/v1\n"
+        "    key_env: VIBEPROXY_API_KEY\n"
+        "    model: claude-opus-4-7\n"
+        "    context_length: 200000\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("VIBEPROXY_API_KEY=sk-test-profile\n", encoding="utf-8")
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                extra={"topic_profiles_safe_root": str(profiles_root)}
+            )
+        }
+    )
+
+    gateway_run._hermes_home = gateway_home
+    with hermes_home_context(gateway_home):
+        runner = _make_runner(config)
+        source = _source(agent_profile="cybrel-test", agent_hermes_home=str(profile_home))
+        runner._session_store_for_source(source).get_or_create_session(source)
+        event = MessageEvent(text="/new", message_type=MessageType.TEXT, source=source)
+        response = await runner._handle_reset_command(event)
+
+    text = str(response)
+    assert "claude-opus-4-7" in text
+    assert "custom:vibeproxy" in text
+    assert "127.0.0.1:8318" in text
+    assert "200K" in text
+    assert "gpt-5.5" not in text
+    assert "openai-codex" not in text
+
+
+@pytest.mark.asyncio
+async def test_reset_command_session_info_does_not_borrow_global_credentials(monkeypatch, tmp_path):
+    from gateway import run as gateway_run
+
+    gateway_home = tmp_path / "gateway"
+    profiles_root = gateway_home / "profiles"
+    profile_home = profiles_root / "cybrel-test"
+    profile_home.mkdir(parents=True)
+    gateway_home.mkdir(exist_ok=True)
+    (gateway_home / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom:vibeproxy\n"
+        "  default: claude-opus-4-7\n"
+        "custom_providers:\n"
+        "  - name: vibeproxy\n"
+        "    base_url: http://127.0.0.1:8318/v1\n"
+        "    key_env: VIBEPROXY_API_KEY\n"
+        "    model: claude-opus-4-7\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-global-must-not-leak")
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                extra={"topic_profiles_safe_root": str(profiles_root)}
+            )
+        }
+    )
+
+    gateway_run._hermes_home = gateway_home
+    with hermes_home_context(gateway_home):
+        runner = _make_runner(config)
+        source = _source(agent_profile="cybrel-test", agent_hermes_home=str(profile_home))
+        runner._session_store_for_source(source).get_or_create_session(source)
+        event = MessageEvent(text="/new", message_type=MessageType.TEXT, source=source)
+        response = await runner._handle_reset_command(event)
+
+    text = str(response)
+    assert "claude-opus-4-7" in text
+    assert "custom:vibeproxy" in text
+    assert "gpt-5.5" not in text
+    assert "openai-codex" not in text
+
+
+@pytest.mark.asyncio
+async def test_reset_command_displays_profile_scoped_fallback_model(tmp_path):
+    from gateway import run as gateway_run
+
+    gateway_home = tmp_path / "gateway"
+    profiles_root = gateway_home / "profiles"
+    profile_home = profiles_root / "cybrel-test"
+    profile_home.mkdir(parents=True)
+    gateway_home.mkdir(exist_ok=True)
+    (gateway_home / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom:vibeproxy\n"
+        "  default: claude-opus-4-7\n"
+        "custom_providers:\n"
+        "  - name: vibeproxy\n"
+        "    base_url: http://127.0.0.1:8318/v1\n"
+        "    key_env: VIBEPROXY_API_KEY\n"
+        "    model: claude-opus-4-7\n"
+        "fallback_providers:\n"
+        "  - provider: openrouter\n"
+        "    model: openrouter/fallback-model\n"
+        "    key_env: OPENROUTER_API_KEY\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENROUTER_API_KEY=sk-profile-fallback\n", encoding="utf-8")
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                extra={"topic_profiles_safe_root": str(profiles_root)}
+            )
+        }
+    )
+
+    gateway_run._hermes_home = gateway_home
+    with hermes_home_context(gateway_home):
+        runner = _make_runner(config)
+        source = _source(agent_profile="cybrel-test", agent_hermes_home=str(profile_home))
+        runner._session_store_for_source(source).get_or_create_session(source)
+        event = MessageEvent(text="/new", message_type=MessageType.TEXT, source=source)
+        response = await runner._handle_reset_command(event)
+
+    text = str(response)
+    assert "openrouter/fallback-model" in text
+    assert "Provider: openrouter" in text
+    assert "gpt-5.5" not in text
+    assert "openai-codex" not in text
+
+
+def test_reset_session_info_call_sites_preserve_source_context():
+    import inspect
+
+    from gateway.run import GatewayRunner
+
+    message_handler = inspect.getsource(GatewayRunner._handle_message_with_agent)
+    reset_handler = inspect.getsource(GatewayRunner._handle_reset_command)
+
+    assert "_format_session_info(source)" in message_handler
+    assert "_format_session_info(source)" in reset_handler
+    assert "_format_session_info()" not in message_handler
+    assert "_format_session_info()" not in reset_handler
+
+
+@pytest.mark.asyncio
 async def test_undo_command_rewrites_profile_transcript_only_for_routed_topic(tmp_path):
     gateway_home = tmp_path / "gateway"
     profiles_root = gateway_home / "profiles"
